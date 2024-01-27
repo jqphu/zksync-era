@@ -15,6 +15,7 @@ use crate::{
     vm_trace::{Call, CallType},
     web3::types::{AccessList, Index, H2048},
     Address, MiniblockNumber, ProtocolVersionId,
+    VmEvent
 };
 
 pub mod en;
@@ -582,6 +583,7 @@ pub struct DebugCall {
     pub error: Option<String>,
     pub revert_reason: Option<String>,
     pub calls: Vec<DebugCall>,
+    pub events: Vec<VmEvent>
 }
 
 impl From<Call> for DebugCall {
@@ -604,6 +606,8 @@ impl From<Call> for DebugCall {
             error: value.error.clone(),
             revert_reason: value.revert_reason,
             calls,
+            // TODO(jqphu): is this fine?
+            events: vec![]
         }
     }
 }
