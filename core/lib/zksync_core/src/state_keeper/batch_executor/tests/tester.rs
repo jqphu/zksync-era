@@ -28,7 +28,7 @@ use crate::{
     state_keeper::{
         batch_executor::{BatchExecutorHandle, TxExecutionResult},
         tests::{default_l1_batch_env, default_system_env, BASE_SYSTEM_CONTRACTS},
-        L1BatchExecutorBuilder, MainBatchExecutorBuilder,
+        BatchExecutor, MainBatchExecutor,
     },
     utils::testonly::prepare_recovery_snapshot,
 };
@@ -103,7 +103,7 @@ impl Tester {
         l1_batch_env: L1BatchEnv,
         system_env: SystemEnv,
     ) -> BatchExecutorHandle {
-        let mut builder = MainBatchExecutorBuilder::new(
+        let mut builder = MainBatchExecutor::new(
             self.db_dir.path().to_str().unwrap().to_owned(),
             self.pool.clone(),
             self.config.max_allowed_tx_gas_limit.into(),
@@ -173,7 +173,8 @@ impl Tester {
                 Default::default(),
                 Default::default(),
             )
-            .await;
+            .await
+            .unwrap();
         }
     }
 
@@ -199,7 +200,8 @@ impl Tester {
             storage
                 .storage_logs_dal()
                 .append_storage_logs(MiniblockNumber(0), &[(H256::zero(), vec![storage_log])])
-                .await;
+                .await
+                .unwrap();
             if storage
                 .storage_logs_dedup_dal()
                 .filter_written_slots(&[storage_log.key.hashed_key()])
@@ -210,6 +212,7 @@ impl Tester {
                     .storage_logs_dedup_dal()
                     .insert_initial_writes(L1BatchNumber(0), &[storage_log.key])
                     .await
+                    .unwrap();
             }
         }
     }
@@ -384,7 +387,11 @@ impl StorageSnapshot {
         let mut storage = connection_pool.access_storage().await.unwrap();
         let all_logs = storage
             .snapshots_creator_dal()
-            .get_storage_logs_chunk(MiniblockNumber(0), H256::zero()..=H256::repeat_byte(0xff))
+            .get_storage_logs_chunk(
+                MiniblockNumber(0),
+                L1BatchNumber(0),
+                H256::zero()..=H256::repeat_byte(0xff),
+            )
             .await
             .unwrap();
         let factory_deps = storage
@@ -396,6 +403,7 @@ impl StorageSnapshot {
             .into_iter()
             .map(|log| (log.key, log.value))
             .collect();
+        drop(storage);
 
         let executor = tester.create_batch_executor().await;
         let mut l2_block_env = L2BlockEnv {
@@ -449,6 +457,7 @@ impl StorageSnapshot {
         )
         .finalize(ProtocolVersionId::latest());
 
+        let mut storage = connection_pool.access_storage().await.unwrap();
         storage.blocks_dal().delete_genesis().await.unwrap();
         Self {
             miniblock_number: MiniblockNumber(l2_block_env.number),

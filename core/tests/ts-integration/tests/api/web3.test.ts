@@ -215,9 +215,6 @@ describe('web3 API compatibility tests', () => {
     test('Should test various token methods', async () => {
         const tokens = await alice.provider.getConfirmedTokens();
         expect(tokens).not.toHaveLength(0); // Should not be an empty array.
-
-        const price = await alice.provider.getTokenPrice(l2Token);
-        expect(+price!).toEqual(expect.any(Number));
     });
 
     test('Should check transactions from API / Legacy tx', async () => {
@@ -732,12 +729,24 @@ describe('web3 API compatibility tests', () => {
         let latestBlock = await alice.provider.getBlock('latest');
 
         // Check API returns identical logs by block number and block hash.
-        const getLogsByNumber = await alice.provider.getLogs({
-            fromBlock: latestBlock.number,
-            toBlock: latestBlock.number
+        // Logs can have different `l1BatchNumber` field though,
+        // if L1 batch was sealed in between API requests are processed.
+        const getLogsByNumber = (
+            await alice.provider.getLogs({
+                fromBlock: latestBlock.number,
+                toBlock: latestBlock.number
+            })
+        ).map((x) => {
+            x.l1BatchNumber = 0; // Set bogus value.
+            return x;
         });
-        const getLogsByHash = await alice.provider.getLogs({
-            blockHash: latestBlock.hash
+        const getLogsByHash = (
+            await alice.provider.getLogs({
+                blockHash: latestBlock.hash
+            })
+        ).map((x) => {
+            x.l1BatchNumber = 0; // Set bogus value.
+            return x;
         });
         await expect(getLogsByNumber).toEqual(getLogsByHash);
 

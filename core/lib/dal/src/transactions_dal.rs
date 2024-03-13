@@ -11,7 +11,7 @@ use zksync_types::{
     l2::L2Tx,
     protocol_version::ProtocolUpgradeTx,
     tx::{tx_execution_info::TxExecutionStatus, TransactionExecutionResult},
-    vm_trace::{Call, VmExecutionTrace},
+    vm_trace::Call,
     Address, ExecuteTransactionCommon, L1BatchNumber, L1BlockNumber, MiniblockNumber, PriorityOpId,
     Transaction, H256, PROTOCOL_UPGRADE_TX_TYPE, U256,
 };
@@ -256,6 +256,27 @@ impl TransactionsDal<'_, '_> {
     ) -> L2TxSubmissionResult {
         {
             let tx_hash = tx.hash();
+            let is_duplicate = sqlx::query!(
+                r#"
+                SELECT
+                    TRUE
+                FROM
+                    transactions
+                WHERE
+                    hash = $1
+                "#,
+                tx_hash.as_bytes(),
+            )
+            .fetch_optional(self.storage.conn())
+            .await
+            .unwrap()
+            .is_some();
+
+            if is_duplicate {
+                tracing::debug!("Prevented inserting duplicate L2 transaction {tx_hash:?} to DB");
+                return L2TxSubmissionResult::Duplicate;
+            }
+
             let initiator_address = tx.initiator_account();
             let contract_address = tx.execute.contract_address.as_bytes();
             let json_data = serde_json::to_value(&tx.execute)
@@ -411,6 +432,7 @@ impl TransactionsDal<'_, '_> {
                     if let error::Error::Database(ref error) = err {
                         if let Some(constraint) = error.constraint() {
                             if constraint == "transactions_pkey" {
+                                tracing::debug!("Attempted to insert duplicate L2 transaction {tx_hash:?} to DB");
                                 return L2TxSubmissionResult::Duplicate;
                             }
                         }
@@ -786,7 +808,7 @@ impl TransactionsDal<'_, '_> {
                 )
                 .instrument("insert_call_tracer")
                 .report_latency()
-                .execute(transaction.conn())
+                .execute(&mut transaction)
                 .await
                 .unwrap();
             }
@@ -1049,48 +1071,6 @@ impl TransactionsDal<'_, '_> {
             .and_then(|row| row.op_id)
             .map(|value| PriorityOpId((value + 1) as u64))
             .unwrap_or_default()
-        }
-    }
-
-    pub async fn insert_trace(&mut self, hash: H256, trace: VmExecutionTrace) {
-        {
-            sqlx::query!(
-                r#"
-                INSERT INTO
-                    transaction_traces (tx_hash, trace, created_at, updated_at)
-                VALUES
-                    ($1, $2, NOW(), NOW())
-                "#,
-                hash.as_bytes(),
-                serde_json::to_value(trace).unwrap()
-            )
-            .execute(self.storage.conn())
-            .await
-            .unwrap();
-        }
-    }
-
-    pub async fn get_trace(&mut self, hash: H256) -> Option<VmExecutionTrace> {
-        {
-            let trace = sqlx::query!(
-                r#"
-                SELECT
-                    trace
-                FROM
-                    transaction_traces
-                WHERE
-                    tx_hash = $1
-                "#,
-                hash.as_bytes()
-            )
-            .fetch_optional(self.storage.conn())
-            .await
-            .unwrap()
-            .map(|record| record.trace);
-            trace.map(|trace| {
-                serde_json::from_value(trace)
-                    .unwrap_or_else(|_| panic!("invalid trace json in database for {:?}", hash))
-            })
         }
     }
 

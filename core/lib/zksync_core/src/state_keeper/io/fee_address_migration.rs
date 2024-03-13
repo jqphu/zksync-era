@@ -10,7 +10,9 @@ use zksync_dal::{ConnectionPool, StorageProcessor};
 use zksync_types::MiniblockNumber;
 
 /// Runs the migration for pending miniblocks.
-pub(crate) async fn migrate_pending_miniblocks(storage: &mut StorageProcessor<'_>) {
+pub(crate) async fn migrate_pending_miniblocks(
+    storage: &mut StorageProcessor<'_>,
+) -> anyhow::Result<()> {
     let started_at = Instant::now();
     tracing::info!("Started migrating `fee_account_address` for pending miniblocks");
 
@@ -19,10 +21,10 @@ pub(crate) async fn migrate_pending_miniblocks(storage: &mut StorageProcessor<'_
         .blocks_dal()
         .check_l1_batches_have_fee_account_address()
         .await
-        .expect("Failed getting metadata for l1_batches table");
+        .context("failed getting metadata for l1_batches table")?;
     if !l1_batches_have_fee_account_address {
         tracing::info!("`l1_batches.fee_account_address` column is removed; assuming that the migration is complete");
-        return;
+        return Ok(());
     }
 
     #[allow(deprecated)]
@@ -30,9 +32,10 @@ pub(crate) async fn migrate_pending_miniblocks(storage: &mut StorageProcessor<'_
         .blocks_dal()
         .copy_fee_account_address_for_pending_miniblocks()
         .await
-        .expect("Failed migrating `fee_account_address` for pending miniblocks");
+        .context("failed migrating `fee_account_address` for pending miniblocks")?;
     let elapsed = started_at.elapsed();
     tracing::info!("Migrated `fee_account_address` for {rows_affected} miniblocks in {elapsed:?}");
+    Ok(())
 }
 
 /// Runs the migration for non-pending miniblocks. Should be run as a background task.
@@ -41,6 +44,22 @@ pub(crate) async fn migrate_miniblocks(
     last_miniblock: MiniblockNumber,
     stop_receiver: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    // `migrate_miniblocks_inner` assumes that miniblocks start from the genesis (i.e., no snapshot recovery).
+    // Since snapshot recovery is later that the fee address migration in terms of code versioning,
+    // the migration is always no-op in case of snapshot recovery; all miniblocks added after recovery are guaranteed
+    // to have their fee address set.
+    let mut storage = pool.access_storage_tagged("state_keeper").await?;
+    if storage
+        .snapshot_recovery_dal()
+        .get_applied_snapshot_status()
+        .await?
+        .is_some()
+    {
+        tracing::info!("Detected snapshot recovery; fee address migration is skipped as no-op");
+        return Ok(());
+    }
+    drop(storage);
+
     let MigrationOutput {
         miniblocks_affected,
     } = migrate_miniblocks_inner(

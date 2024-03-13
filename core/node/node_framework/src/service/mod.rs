@@ -1,17 +1,22 @@
-use std::{collections::HashMap, fmt};
+use std::{collections::HashMap, fmt, time::Duration};
 
 use futures::{future::BoxFuture, FutureExt};
 use tokio::{runtime::Runtime, sync::watch};
 
 pub use self::{context::ServiceContext, stop_receiver::StopReceiver};
 use crate::{
-    resource::{ResourceId, ResourceProvider, StoredResource},
+    resource::{ResourceId, StoredResource},
     task::Task,
     wiring_layer::{WiringError, WiringLayer},
 };
 
 mod context;
 mod stop_receiver;
+#[cfg(test)]
+mod tests;
+
+// A reasonable amount of time for any task to finish the shutdown process
+const TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// "Manager" class for a set of tasks. Collects all the resources and tasks,
 /// then runs tasks until completion.
@@ -29,8 +34,6 @@ mod stop_receiver;
 ///   - calls `after_node_shutdown` hook for every task that has provided it.
 ///   - returns the result of the task that has finished.
 pub struct ZkStackService {
-    /// Primary source of resources for tasks.
-    resource_provider: Box<dyn ResourceProvider>,
     /// Cache of resources that have been requested at least by one task.
     resources: HashMap<ResourceId, Box<dyn StoredResource>>,
     /// List of wiring layers.
@@ -46,15 +49,15 @@ pub struct ZkStackService {
 
 impl fmt::Debug for ZkStackService {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ZkSyncNode").finish_non_exhaustive()
+        f.debug_struct("ZkStackService").finish_non_exhaustive()
     }
 }
 
 impl ZkStackService {
-    pub fn new<R: ResourceProvider>(resource_provider: R) -> anyhow::Result<Self> {
+    pub fn new() -> anyhow::Result<Self> {
         if tokio::runtime::Handle::try_current().is_ok() {
             anyhow::bail!(
-                "Detected a Tokio Runtime. ZkSyncNode manages its own runtime and does not support nested runtimes"
+                "Detected a Tokio Runtime. ZkStackService manages its own runtime and does not support nested runtimes"
             );
         }
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -64,7 +67,6 @@ impl ZkStackService {
 
         let (stop_sender, _stop_receiver) = watch::channel(false);
         let self_ = Self {
-            resource_provider: Box::new(resource_provider),
             resources: HashMap::default(),
             layers: Vec::new(),
             tasks: Vec::new(),
@@ -93,7 +95,8 @@ impl ZkStackService {
         let runtime_handle = self.runtime.handle().clone();
         for layer in wiring_layers {
             let name = layer.layer_name().to_string();
-            let task_result = runtime_handle.block_on(layer.wire(ServiceContext::new(&mut self)));
+            let task_result =
+                runtime_handle.block_on(layer.wire(ServiceContext::new(&name, &mut self)));
             if let Err(err) = task_result {
                 // We don't want to bail on the first error, since it'll provide worse DevEx:
                 // People likely want to fix as much problems as they can in one go, rather than have
@@ -145,30 +148,44 @@ impl ZkStackService {
             .collect();
 
         // Run the tasks until one of them exits.
-        // TODO (QIT-24): wrap every task into a timeout to prevent hanging.
-        let (resolved, idx, remaining) = self
+        let (resolved, resolved_idx, remaining) = self
             .runtime
             .block_on(futures::future::select_all(join_handles));
-        let task_name = tasks[idx].name.clone();
+        let resolved_task_name = tasks[resolved_idx].name.clone();
         let failure = match resolved {
             Ok(Ok(())) => {
-                tracing::info!("Task {task_name} completed");
+                tracing::info!("Task {resolved_task_name} completed");
                 false
             }
             Ok(Err(err)) => {
-                tracing::error!("Task {task_name} exited with an error: {err}");
+                tracing::error!("Task {resolved_task_name} exited with an error: {err}");
                 true
             }
             Err(_) => {
-                tracing::error!("Task {task_name} panicked");
+                tracing::error!("Task {resolved_task_name} panicked");
                 true
             }
         };
 
+        let remaining_tasks_with_timeout: Vec<_> = remaining
+            .into_iter()
+            .map(|task| async { tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, task).await })
+            .collect();
+
         // Send stop signal to remaining tasks and wait for them to finish.
         // Given that we are shutting down, we do not really care about returned values.
         self.stop_sender.send(true).ok();
-        self.runtime.block_on(futures::future::join_all(remaining));
+        let execution_results = self
+            .runtime
+            .block_on(futures::future::join_all(remaining_tasks_with_timeout));
+        let execution_timeouts_count = execution_results.iter().filter(|&r| r.is_err()).count();
+        if execution_timeouts_count > 0 {
+            tracing::warn!(
+                "{execution_timeouts_count} tasks didn't finish in {TASK_SHUTDOWN_TIMEOUT:?} and were dropped"
+            );
+        } else {
+            tracing::info!("Remaining tasks finished without reaching timeouts");
+        }
 
         // Call after_node_shutdown hooks.
         let local_set = tokio::task::LocalSet::new();
@@ -180,7 +197,7 @@ impl ZkStackService {
         local_set.block_on(&self.runtime, futures::future::join_all(join_handles));
 
         if failure {
-            anyhow::bail!("Task {task_name} failed");
+            anyhow::bail!("Task {resolved_task_name} failed");
         } else {
             Ok(())
         }

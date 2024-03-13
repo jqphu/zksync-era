@@ -1,14 +1,25 @@
-use std::{env, fmt, future::Future, panic::Location, sync::Arc, time::Duration};
+use std::{
+    env, fmt,
+    future::Future,
+    panic::Location,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use anyhow::Context as _;
+use rand::Rng;
 use sqlx::{
     pool::PoolConnection,
     postgres::{PgConnectOptions, PgPool, PgPoolOptions, Postgres},
 };
 
 pub use self::processor::StorageProcessor;
-use self::processor::{StorageProcessorTags, TracedConnections};
-use crate::metrics::CONNECTION_METRICS;
+pub(crate) use self::processor::StorageProcessorTags;
+use self::processor::TracedConnections;
+use crate::metrics::{PostgresMetrics, CONNECTION_METRICS};
 
 mod processor;
 
@@ -34,10 +45,18 @@ impl fmt::Debug for ConnectionPoolBuilder {
 }
 
 impl ConnectionPoolBuilder {
+    /// Overrides the maximum number of connections that can be allocated by the pool.
+    pub fn set_max_size(&mut self, max_size: u32) -> &mut Self {
+        self.max_size = max_size;
+        self
+    }
+
     /// Sets the acquire timeout for a single connection attempt. There are multiple attempts (currently 3)
-    /// before `access_storage*` methods return an error.
-    pub fn set_acquire_timeout(&mut self, timeout: Duration) -> &mut Self {
-        self.acquire_timeout = timeout;
+    /// before `access_storage*` methods return an error. If not specified, the acquire timeout will not be set.
+    pub fn set_acquire_timeout(&mut self, timeout: Option<Duration>) -> &mut Self {
+        if let Some(timeout) = timeout {
+            self.acquire_timeout = timeout;
+        }
         self
     }
 
@@ -48,6 +67,11 @@ impl ConnectionPoolBuilder {
     pub fn set_statement_timeout(&mut self, timeout: Option<Duration>) -> &mut Self {
         self.statement_timeout = timeout;
         self
+    }
+
+    /// Returns the maximum number of connections that can be allocated by the pool.
+    pub fn max_size(&self) -> u32 {
+        self.max_size
     }
 
     /// Builds a connection pool from this builder.
@@ -75,15 +99,6 @@ impl ConnectionPoolBuilder {
             traced_connections: None,
         })
     }
-
-    /// Builds a connection pool that has a single connection.
-    pub async fn build_singleton(&self) -> anyhow::Result<ConnectionPool> {
-        let singleton_builder = Self {
-            max_size: 1,
-            ..self.clone()
-        };
-        singleton_builder.build().await
-    }
 }
 
 #[derive(Debug)]
@@ -102,7 +117,7 @@ impl TestTemplate {
 
     async fn connect_to(db_url: &url::Url) -> sqlx::Result<sqlx::PgConnection> {
         use sqlx::Connection as _;
-        let mut attempts = 10;
+        let mut attempts = 20;
         loop {
             match sqlx::PgConnection::connect(db_url.as_ref()).await {
                 Ok(conn) => return Ok(conn),
@@ -113,7 +128,7 @@ impl TestTemplate {
                     }
                 }
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
 
@@ -150,7 +165,6 @@ impl TestTemplate {
     /// The database is not cleaned up automatically, but rather the whole Postgres
     /// container is recreated whenever you call "zk test rust".
     pub async fn create_db(&self, connections: u32) -> anyhow::Result<ConnectionPoolBuilder> {
-        use rand::Rng as _;
         use sqlx::Executor as _;
 
         let mut conn = Self::connect_to(&self.url(""))
@@ -166,6 +180,51 @@ impl TestTemplate {
             self.url(&db_new).as_ref(),
             connections,
         ))
+    }
+}
+
+/// Global DB connection parameters applied to all [`ConnectionPool`] instances.
+#[derive(Debug)]
+pub struct GlobalConnectionPoolConfig {
+    // We consider millisecond precision to be enough for config purposes.
+    long_connection_threshold_ms: AtomicU64,
+    slow_query_threshold_ms: AtomicU64,
+}
+
+impl GlobalConnectionPoolConfig {
+    const fn new() -> Self {
+        Self {
+            long_connection_threshold_ms: AtomicU64::new(5_000), // 5 seconds
+            slow_query_threshold_ms: AtomicU64::new(100),        // 0.1 seconds
+        }
+    }
+
+    pub(crate) fn long_connection_threshold(&self) -> Duration {
+        Duration::from_millis(self.long_connection_threshold_ms.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn slow_query_threshold(&self) -> Duration {
+        Duration::from_millis(self.slow_query_threshold_ms.load(Ordering::Relaxed))
+    }
+
+    /// Sets the threshold for the DB connection lifetime to denote a connection as long-living and log its details.
+    pub fn set_long_connection_threshold(&self, threshold: Duration) -> anyhow::Result<&Self> {
+        let millis = u64::try_from(threshold.as_millis())
+            .context("long_connection_threshold is unreasonably large")?;
+        self.long_connection_threshold_ms
+            .store(millis, Ordering::Relaxed);
+        tracing::info!("Set long connection threshold to {threshold:?}");
+        Ok(self)
+    }
+
+    /// Sets the threshold to denote a DB query as "slow" and log its details.
+    pub fn set_slow_query_threshold(&self, threshold: Duration) -> anyhow::Result<&Self> {
+        let millis = u64::try_from(threshold.as_millis())
+            .context("slow_query_threshold is unreasonably large")?;
+        self.slow_query_threshold_ms
+            .store(millis, Ordering::Relaxed);
+        tracing::info!("Set slow query threshold to {threshold:?}");
+        Ok(self)
     }
 }
 
@@ -189,7 +248,14 @@ impl fmt::Debug for ConnectionPool {
 }
 
 impl ConnectionPool {
-    const TEST_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(1);
+    const TEST_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Returns a reference to the global configuration parameters applied for all DB pools. For consistency, these parameters
+    /// should be changed early in the app life cycle.
+    pub fn global_config() -> &'static GlobalConnectionPoolConfig {
+        static CONFIG: GlobalConnectionPoolConfig = GlobalConnectionPoolConfig::new();
+        &CONFIG
+    }
 
     /// Creates a test pool with a reasonably large number of connections.
     ///
@@ -210,7 +276,7 @@ impl ConnectionPool {
             .await
             .expect("failed creating database for tests");
         let mut pool = builder
-            .set_acquire_timeout(Self::TEST_ACQUIRE_TIMEOUT)
+            .set_acquire_timeout(Some(Self::TEST_ACQUIRE_TIMEOUT))
             .build()
             .await
             .expect("cannot build connection pool");
@@ -239,6 +305,12 @@ impl ConnectionPool {
     /// idle ones).
     pub fn max_size(&self) -> u32 {
         self.max_size
+    }
+
+    /// Uses this pool to report Postgres-wide metrics (e.g., table sizes). Should be called sparingly to not spam
+    /// identical metrics from multiple places. The returned future runs indefinitely and should be spawned as a Tokio task.
+    pub async fn run_postgres_metrics_scraping(self, scrape_interval: Duration) {
+        PostgresMetrics::run_scraping(self, scrape_interval).await;
     }
 
     /// Creates a `StorageProcessor` entity over a recoverable connection.
@@ -298,11 +370,10 @@ impl ConnectionPool {
         &self,
         tags: Option<&StorageProcessorTags>,
     ) -> anyhow::Result<PoolConnection<Postgres>> {
-        const DB_CONNECTION_RETRIES: u32 = 3;
-        const BACKOFF_INTERVAL: Duration = Duration::from_secs(1);
+        const DB_CONNECTION_RETRIES: usize = 3;
+        const AVG_BACKOFF_INTERVAL: Duration = Duration::from_secs(1);
 
-        let mut retry_count = 0;
-        while retry_count < DB_CONNECTION_RETRIES {
+        for _ in 0..DB_CONNECTION_RETRIES {
             CONNECTION_METRICS
                 .pool_size
                 .observe(self.inner.size() as usize);
@@ -311,21 +382,18 @@ impl ConnectionPool {
             let connection = self.inner.acquire().await;
             let connection_err = match connection {
                 Ok(connection) => return Ok(connection),
-                Err(err) => {
-                    retry_count += 1;
-                    err
-                }
+                Err(err) => err,
             };
 
             Self::report_connection_error(&connection_err);
-            let tags_display: &(dyn fmt::Display + Send + Sync) = match tags {
-                Some(tags) => tags,
-                None => &"not tagged",
-            };
+            // Slightly randomize back-off interval so that we don't end up stampeding the DB.
+            let jitter = rand::thread_rng().gen_range(0.8..1.2);
+            let backoff_interval = AVG_BACKOFF_INTERVAL.mul_f32(jitter);
+            let tags_display = StorageProcessorTags::display(tags);
             tracing::warn!(
-                "Failed to get connection to DB ({tags_display}), backing off for {BACKOFF_INTERVAL:?}: {connection_err}"
+                "Failed to get connection to DB ({tags_display}), backing off for {backoff_interval:?}: {connection_err}"
             );
-            tokio::time::sleep(BACKOFF_INTERVAL).await;
+            tokio::time::sleep(backoff_interval).await;
         }
 
         // Attempting to get the pooled connection for the last time
@@ -333,10 +401,7 @@ impl ConnectionPool {
             Ok(conn) => Ok(conn),
             Err(err) => {
                 Self::report_connection_error(&err);
-                let tags_display: &dyn fmt::Display = match tags {
-                    Some(tags) => tags,
-                    None => &"not tagged",
-                };
+                let tags_display = StorageProcessorTags::display(tags);
                 if let Some(traced_connections) = &self.traced_connections {
                     anyhow::bail!(
                         "Run out of retries getting a DB connection ({tags_display}), last error: {err}\n\

@@ -1,10 +1,9 @@
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use zksync_contracts::verifier_contract;
 use zksync_eth_client::{CallFunctionArgs, Error as EthClientError, EthInterface};
-use zksync_l1_contract_interface::pre_boojum_verifier::old_l1_vk_commitment;
 use zksync_types::{
-    ethabi::{Contract, Token},
+    ethabi::Contract,
     web3::{
         self,
         contract::tokens::Detokenize,
@@ -54,7 +53,7 @@ const TOO_MANY_RESULTS_ALCHEMY: &str = "response size exceeded";
 
 #[derive(Debug)]
 pub struct EthHttpQueryClient {
-    client: Box<dyn EthInterface>,
+    client: Arc<dyn EthInterface>,
     topics: Vec<H256>,
     zksync_contract_addr: Address,
     /// Address of the `Governance` contract. It's optional because it is present only for post-boojum chains.
@@ -66,7 +65,7 @@ pub struct EthHttpQueryClient {
 
 impl EthHttpQueryClient {
     pub fn new(
-        client: Box<dyn EthInterface>,
+        client: Arc<dyn EthInterface>,
         zksync_contract_addr: Address,
         governance_address: Option<Address>,
         confirmations_for_eth_event: Option<u64>,
@@ -112,22 +111,13 @@ impl EthHttpQueryClient {
 #[async_trait::async_trait]
 impl EthClient for EthHttpQueryClient {
     async fn scheduler_vk_hash(&self, verifier_address: Address) -> Result<H256, Error> {
-        // This is here for backward compatibility with the old verifier:
-        // Legacy verifier returns the full verification key;
         // New verifier returns the hash of the verification key.
 
         let args = CallFunctionArgs::new("verificationKeyHash", ())
             .for_contract(verifier_address, self.verifier_contract_abi.clone());
-        let vk_hash_tokens = self.client.call_contract_function(args).await;
+        let vk_hash_tokens = self.client.call_contract_function(args).await?;
 
-        if let Ok(tokens) = vk_hash_tokens {
-            Ok(H256::from_tokens(tokens)?)
-        } else {
-            let args = CallFunctionArgs::new("get_verification_key", ())
-                .for_contract(verifier_address, self.verifier_contract_abi.clone());
-            let vk = self.client.call_contract_function(args).await?;
-            Ok(old_l1_vk_commitment(Token::from_tokens(vk)?))
-        }
+        Ok(H256::from_tokens(vk_hash_tokens)?)
     }
 
     async fn get_events(

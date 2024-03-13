@@ -21,8 +21,8 @@ impl StorageLogsDal<'_, '_> {
         &mut self,
         block_number: MiniblockNumber,
         logs: &[(H256, Vec<StorageLog>)],
-    ) {
-        self.insert_storage_logs_inner(block_number, logs, 0).await;
+    ) -> sqlx::Result<()> {
+        self.insert_storage_logs_inner(block_number, logs, 0).await
     }
 
     async fn insert_storage_logs_inner(
@@ -30,7 +30,7 @@ impl StorageLogsDal<'_, '_> {
         block_number: MiniblockNumber,
         logs: &[(H256, Vec<StorageLog>)],
         mut operation_number: u32,
-    ) {
+    ) -> sqlx::Result<()> {
         let mut copy = self
             .storage
             .conn()
@@ -41,8 +41,7 @@ impl StorageLogsDal<'_, '_> {
                 )
                 FROM STDIN WITH (DELIMITER '|')",
             )
-            .await
-            .unwrap();
+            .await?;
 
         let mut buffer = String::new();
         let now = Utc::now().naive_utc().to_string();
@@ -64,8 +63,9 @@ impl StorageLogsDal<'_, '_> {
                 operation_number += 1;
             }
         }
-        copy.send(buffer.as_bytes()).await.unwrap();
-        copy.finish().await.unwrap();
+        copy.send(buffer.as_bytes()).await?;
+        copy.finish().await?;
+        Ok(())
     }
 
     pub async fn insert_storage_logs_from_snapshot(
@@ -112,7 +112,7 @@ impl StorageLogsDal<'_, '_> {
         &mut self,
         block_number: MiniblockNumber,
         logs: &[(H256, Vec<StorageLog>)],
-    ) {
+    ) -> sqlx::Result<()> {
         let operation_number = sqlx::query!(
             r#"
             SELECT
@@ -125,14 +125,13 @@ impl StorageLogsDal<'_, '_> {
             block_number.0 as i64
         )
         .fetch_one(self.storage.conn())
-        .await
-        .unwrap()
+        .await?
         .max
         .map(|max| max as u32 + 1)
         .unwrap_or(0);
 
         self.insert_storage_logs_inner(block_number, logs, operation_number)
-            .await;
+            .await
     }
 
     /// Rolls back storage to the specified point in time.
@@ -301,6 +300,55 @@ impl StorageLogsDal<'_, '_> {
         row.count > 0
     }
 
+    /// Returns addresses and the corresponding deployment miniblock numbers among the specified contract
+    /// `addresses`. `at_miniblock` allows filtering deployment by miniblocks.
+    pub async fn filter_deployed_contracts(
+        &mut self,
+        addresses: impl Iterator<Item = Address>,
+        at_miniblock: Option<MiniblockNumber>,
+    ) -> sqlx::Result<HashMap<Address, MiniblockNumber>> {
+        let (bytecode_hashed_keys, address_by_hashed_key): (Vec<_>, HashMap<_, _>) = addresses
+            .map(|address| {
+                let hashed_key = get_code_key(&address).hashed_key().0;
+                (hashed_key, (hashed_key, address))
+            })
+            .unzip();
+        let max_miniblock_number = at_miniblock.map_or(u32::MAX, |number| number.0);
+        // Get the latest `value` and corresponding `miniblock_number` for each of `bytecode_hashed_keys`. For failed deployments,
+        // this value will equal `FAILED_CONTRACT_DEPLOYMENT_BYTECODE_HASH`, so that they can be easily filtered.
+        let rows = sqlx::query!(
+            r#"
+            SELECT DISTINCT
+                ON (hashed_key) hashed_key,
+                miniblock_number,
+                value
+            FROM
+                storage_logs
+            WHERE
+                hashed_key = ANY ($1)
+                AND miniblock_number <= $2
+            ORDER BY
+                hashed_key,
+                miniblock_number DESC,
+                operation_number DESC
+            "#,
+            &bytecode_hashed_keys as &[_],
+            max_miniblock_number as i64
+        )
+        .fetch_all(self.storage.conn())
+        .await?;
+
+        let deployment_data = rows.into_iter().filter_map(|row| {
+            if row.value == FAILED_CONTRACT_DEPLOYMENT_BYTECODE_HASH.as_bytes() {
+                return None;
+            }
+            let miniblock_number = MiniblockNumber(row.miniblock_number as u32);
+            let address = address_by_hashed_key[row.hashed_key.as_slice()];
+            Some((address, miniblock_number))
+        });
+        Ok(deployment_data.collect())
+    }
+
     /// Returns latest values for all [`StorageKey`]s written to in the specified L1 batch
     /// judging by storage logs (i.e., not taking deduplication logic into account).
     pub async fn get_touched_slots_for_l1_batch(
@@ -458,7 +506,7 @@ impl StorageLogsDal<'_, '_> {
         )
         .instrument("get_l1_batches_and_indices_for_initial_writes")
         .report_latency()
-        .fetch_all(self.storage.conn())
+        .fetch_all(self.storage)
         .await?;
 
         Ok(rows
@@ -811,7 +859,8 @@ mod tests {
         let logs = [(H256::zero(), logs)];
         conn.storage_logs_dal()
             .insert_storage_logs(MiniblockNumber(number), &logs)
-            .await;
+            .await
+            .unwrap();
         #[allow(deprecated)]
         conn.storage_dal().apply_storage_logs(&logs).await;
         conn.blocks_dal()
@@ -849,7 +898,8 @@ mod tests {
         let more_logs = [(H256::repeat_byte(1), vec![third_log])];
         conn.storage_logs_dal()
             .append_storage_logs(MiniblockNumber(1), &more_logs)
-            .await;
+            .await
+            .unwrap();
         #[allow(deprecated)]
         conn.storage_dal().apply_storage_logs(&more_logs).await;
 
@@ -961,7 +1011,8 @@ mod tests {
         let written_keys: Vec<_> = logs.iter().map(|log| log.key).collect();
         conn.storage_logs_dedup_dal()
             .insert_initial_writes(L1BatchNumber(1), &written_keys)
-            .await;
+            .await
+            .unwrap();
 
         let new_logs: Vec<_> = (5_u64..20)
             .map(|i| {
@@ -973,7 +1024,8 @@ mod tests {
         let new_written_keys: Vec<_> = new_logs[5..].iter().map(|log| log.key).collect();
         conn.storage_logs_dedup_dal()
             .insert_initial_writes(L1BatchNumber(2), &new_written_keys)
-            .await;
+            .await
+            .unwrap();
 
         let logs_for_revert = conn
             .storage_logs_dal()
@@ -1032,7 +1084,8 @@ mod tests {
             assert!(initial_keys.len() < logs.len());
             conn.storage_logs_dedup_dal()
                 .insert_initial_writes(L1BatchNumber(l1_batch), &initial_keys)
-                .await;
+                .await
+                .unwrap();
         }
 
         let logs_for_revert = conn
@@ -1109,7 +1162,8 @@ mod tests {
         initial_keys.sort_unstable();
         conn.storage_logs_dedup_dal()
             .insert_initial_writes(L1BatchNumber(1), &initial_keys)
-            .await;
+            .await
+            .unwrap();
 
         let mut sorted_hashed_keys: Vec<_> = logs.iter().map(|log| log.key.hashed_key()).collect();
         sorted_hashed_keys.sort_unstable();
@@ -1146,6 +1200,146 @@ mod tests {
         assert!(!tree_entries.is_empty() && tree_entries.len() < 10);
         for entry in &tree_entries {
             assert!(key_range.contains(&entry.key));
+        }
+    }
+
+    #[tokio::test]
+    async fn filtering_deployed_contracts() {
+        let contract_address = Address::repeat_byte(1);
+        let other_contract_address = Address::repeat_byte(23);
+        let successful_deployment =
+            StorageLog::new_write_log(get_code_key(&contract_address), H256::repeat_byte(0xff));
+        let failed_deployment = StorageLog::new_write_log(
+            get_code_key(&contract_address),
+            FAILED_CONTRACT_DEPLOYMENT_BYTECODE_HASH,
+        );
+
+        let pool = ConnectionPool::test_pool().await;
+        let mut conn = pool.access_storage().await.unwrap();
+        // If deployment fails then two writes are issued, one that writes `bytecode_hash` to the "correct" value,
+        // and the next write reverts its value back to `FAILED_CONTRACT_DEPLOYMENT_BYTECODE_HASH`.
+        conn.storage_logs_dal()
+            .insert_storage_logs(
+                MiniblockNumber(1),
+                &[(H256::zero(), vec![successful_deployment, failed_deployment])],
+            )
+            .await
+            .unwrap();
+
+        let tested_miniblocks = [
+            None,
+            Some(MiniblockNumber(0)),
+            Some(MiniblockNumber(1)),
+            Some(MiniblockNumber(1)),
+        ];
+        for at_miniblock in tested_miniblocks {
+            let deployed_map = conn
+                .storage_logs_dal()
+                .filter_deployed_contracts(
+                    [contract_address, other_contract_address].into_iter(),
+                    at_miniblock,
+                )
+                .await
+                .unwrap();
+            assert!(
+                deployed_map.is_empty(),
+                "{deployed_map:?} at miniblock {at_miniblock:?}"
+            );
+        }
+
+        conn.storage_logs_dal()
+            .insert_storage_logs(
+                MiniblockNumber(2),
+                &[(H256::zero(), vec![successful_deployment])],
+            )
+            .await
+            .unwrap();
+
+        for old_miniblock in [MiniblockNumber(0), MiniblockNumber(1)] {
+            let deployed_map = conn
+                .storage_logs_dal()
+                .filter_deployed_contracts(
+                    [contract_address, other_contract_address].into_iter(),
+                    Some(old_miniblock),
+                )
+                .await
+                .unwrap();
+            assert!(
+                deployed_map.is_empty(),
+                "{deployed_map:?} at {old_miniblock}"
+            );
+        }
+        for new_miniblock in [None, Some(MiniblockNumber(2))] {
+            let deployed_map = conn
+                .storage_logs_dal()
+                .filter_deployed_contracts(
+                    [contract_address, other_contract_address].into_iter(),
+                    new_miniblock,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                deployed_map,
+                HashMap::from([(contract_address, MiniblockNumber(2))])
+            );
+        }
+
+        let other_successful_deployment = StorageLog::new_write_log(
+            get_code_key(&other_contract_address),
+            H256::repeat_byte(0xff),
+        );
+        conn.storage_logs_dal()
+            .insert_storage_logs(
+                MiniblockNumber(3),
+                &[(H256::zero(), vec![other_successful_deployment])],
+            )
+            .await
+            .unwrap();
+
+        for old_miniblock in [MiniblockNumber(0), MiniblockNumber(1)] {
+            let deployed_map = conn
+                .storage_logs_dal()
+                .filter_deployed_contracts(
+                    [contract_address, other_contract_address].into_iter(),
+                    Some(old_miniblock),
+                )
+                .await
+                .unwrap();
+            assert!(
+                deployed_map.is_empty(),
+                "{deployed_map:?} at miniblock {old_miniblock}"
+            );
+        }
+
+        let deployed_map = conn
+            .storage_logs_dal()
+            .filter_deployed_contracts(
+                [contract_address, other_contract_address].into_iter(),
+                Some(MiniblockNumber(2)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            deployed_map,
+            HashMap::from([(contract_address, MiniblockNumber(2))])
+        );
+
+        for new_miniblock in [None, Some(MiniblockNumber(3))] {
+            let deployed_map = conn
+                .storage_logs_dal()
+                .filter_deployed_contracts(
+                    [contract_address, other_contract_address].into_iter(),
+                    new_miniblock,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                deployed_map,
+                HashMap::from([
+                    (contract_address, MiniblockNumber(2)),
+                    (other_contract_address, MiniblockNumber(3)),
+                ])
+            );
         }
     }
 }

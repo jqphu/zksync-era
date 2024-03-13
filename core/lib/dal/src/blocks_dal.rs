@@ -6,12 +6,11 @@ use std::{
 
 use anyhow::Context as _;
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
-use sqlx::Row;
 use zksync_types::{
     aggregated_operations::AggregatedActionType,
-    block::{BlockGasCount, L1BatchHeader, MiniblockHeader},
+    block::{BlockGasCount, L1BatchHeader, L1BatchTreeData, MiniblockHeader},
     circuit::CircuitStatistic,
-    commitment::{L1BatchMetadata, L1BatchWithMetadata},
+    commitment::{L1BatchCommitmentArtifacts, L1BatchWithMetadata},
     zk_evm_types::LogQuery,
     Address, L1BatchNumber, MiniblockNumber, ProtocolVersionId, H256, U256,
 };
@@ -54,7 +53,7 @@ impl BlocksDal<'_, '_> {
         )
         .instrument("get_sealed_block_number")
         .report_latency()
-        .fetch_one(self.storage.conn())
+        .fetch_one(self.storage)
         .await?;
 
         Ok(row.number.map(|num| L1BatchNumber(num as u32)))
@@ -71,7 +70,7 @@ impl BlocksDal<'_, '_> {
         )
         .instrument("get_sealed_miniblock_number")
         .report_latency()
-        .fetch_one(self.storage.conn())
+        .fetch_one(self.storage)
         .await?;
 
         Ok(row.number.map(|number| MiniblockNumber(number as u32)))
@@ -89,7 +88,7 @@ impl BlocksDal<'_, '_> {
         )
         .instrument("get_earliest_l1_batch_number")
         .report_latency()
-        .fetch_one(self.storage.conn())
+        .fetch_one(self.storage)
         .await?;
 
         Ok(row.number.map(|num| L1BatchNumber(num as u32)))
@@ -110,10 +109,36 @@ impl BlocksDal<'_, '_> {
         )
         .instrument("get_last_block_number_with_metadata")
         .report_latency()
-        .fetch_one(self.storage.conn())
+        .fetch_one(self.storage)
         .await?;
 
         Ok(row.number.map(|num| L1BatchNumber(num as u32)))
+    }
+
+    pub async fn get_next_l1_batch_ready_for_commitment_generation(
+        &mut self,
+    ) -> sqlx::Result<Option<L1BatchNumber>> {
+        let row = sqlx::query!(
+            r#"
+            SELECT
+                number
+            FROM
+                l1_batches
+            WHERE
+                hash IS NOT NULL
+                AND commitment IS NULL
+            ORDER BY
+                number
+            LIMIT
+                1
+            "#
+        )
+        .instrument("get_next_l1_batch_ready_for_commitment_generation")
+        .report_latency()
+        .fetch_optional(self.storage)
+        .await?;
+
+        Ok(row.map(|row| L1BatchNumber(row.number as u32)))
     }
 
     /// Returns the number of the earliest L1 batch with metadata (= state hash) present in the DB,
@@ -133,7 +158,7 @@ impl BlocksDal<'_, '_> {
         )
         .instrument("get_earliest_l1_batch_number_with_metadata")
         .report_latency()
-        .fetch_one(self.storage.conn())
+        .fetch_one(self.storage)
         .await?;
 
         Ok(row.number.map(|num| L1BatchNumber(num as u32)))
@@ -173,7 +198,7 @@ impl BlocksDal<'_, '_> {
         )
         .instrument("get_l1_batches_for_eth_tx_id")
         .with_arg("eth_tx_id", &eth_tx_id)
-        .fetch_all(self.storage.conn())
+        .fetch_all(self.storage)
         .await?;
 
         Ok(l1_batches.into_iter().map(Into::into).collect())
@@ -194,10 +219,7 @@ impl BlocksDal<'_, '_> {
                 bloom,
                 priority_ops_onchain_data,
                 hash,
-                parent_hash,
                 commitment,
-                compressed_write_logs,
-                compressed_contracts,
                 eth_prove_tx_id,
                 eth_commit_tx_id,
                 eth_execute_tx_id,
@@ -207,7 +229,6 @@ impl BlocksDal<'_, '_> {
                 used_contract_hashes,
                 compressed_initial_writes,
                 compressed_repeated_writes,
-                l2_l1_compressed_messages,
                 l2_l1_merkle_root,
                 rollup_last_leaf_index,
                 zkporter_is_available,
@@ -232,7 +253,7 @@ impl BlocksDal<'_, '_> {
         )
         .instrument("get_storage_l1_batch")
         .with_arg("number", &number)
-        .fetch_optional(self.storage.conn())
+        .fetch_optional(self.storage)
         .await
     }
 
@@ -268,7 +289,7 @@ impl BlocksDal<'_, '_> {
         )
         .instrument("get_l1_batch_header")
         .with_arg("number", &number)
-        .fetch_optional(self.storage.conn())
+        .fetch_optional(self.storage)
         .await?
         .map(Into::into))
     }
@@ -292,7 +313,7 @@ impl BlocksDal<'_, '_> {
         .instrument("get_initial_bootloader_heap")
         .report_latency()
         .with_arg("number", &number)
-        .fetch_optional(self.storage.conn())
+        .fetch_optional(self.storage)
         .await?
         else {
             return Ok(None);
@@ -321,7 +342,7 @@ impl BlocksDal<'_, '_> {
         .instrument("get_storage_refunds")
         .report_latency()
         .with_arg("number", &number)
-        .fetch_optional(self.storage.conn())
+        .fetch_optional(self.storage)
         .await?
         else {
             return Ok(None);
@@ -341,6 +362,7 @@ impl BlocksDal<'_, '_> {
         let Some(row) = sqlx::query!(
             r#"
             SELECT
+                serialized_events_queue_bytea,
                 serialized_events_queue
             FROM
                 events_queue
@@ -352,14 +374,20 @@ impl BlocksDal<'_, '_> {
         .instrument("get_events_queue")
         .report_latency()
         .with_arg("number", &number)
-        .fetch_optional(self.storage.conn())
+        .fetch_optional(self.storage)
         .await?
         else {
             return Ok(None);
         };
 
-        let events = serde_json::from_value(row.serialized_events_queue)
-            .context("invalid value for serialized_events_queue in the DB")?;
+        let events = if let Some(serialized_events_queue_bytea) = row.serialized_events_queue_bytea
+        {
+            bincode::deserialize(&serialized_events_queue_bytea)
+                .context("invalid value for serialized_events_queue_bytea in the DB")?
+        } else {
+            serde_json::from_value(row.serialized_events_queue)
+                .context("invalid value for serialized_events_queue in the DB")?
+        };
         Ok(Some(events))
     }
 
@@ -454,8 +482,6 @@ impl BlocksDal<'_, '_> {
         // Serialization should always succeed.
         let initial_bootloader_contents = serde_json::to_value(initial_bootloader_contents)
             .expect("failed to serialize initial_bootloader_contents to JSON value");
-        let events_queue = serde_json::to_value(events_queue)
-            .expect("failed to serialize events_queue to JSON value");
         // Serialization should always succeed.
         let used_contract_hashes = serde_json::to_value(&header.used_contract_hashes)
             .expect("failed to serialize used_contract_hashes to JSON value");
@@ -539,15 +565,17 @@ impl BlocksDal<'_, '_> {
         .execute(transaction.conn())
         .await?;
 
+        let events_queue =
+            bincode::serialize(events_queue).expect("failed to serialize events_queue to bytes");
         sqlx::query!(
             r#"
             INSERT INTO
-                events_queue (l1_batch_number, serialized_events_queue)
+                events_queue (l1_batch_number, serialized_events_queue, serialized_events_queue_bytea)
             VALUES
-                ($1, $2)
+                ($1, '{}', $2)
             "#,
             header.number.0 as i64,
-            events_queue
+            &events_queue
         )
         .execute(transaction.conn())
         .await?;
@@ -724,161 +752,37 @@ impl BlocksDal<'_, '_> {
         Ok(())
     }
 
-    pub async fn save_genesis_l1_batch_metadata(
-        &mut self,
-        metadata: &L1BatchMetadata,
-    ) -> sqlx::Result<()> {
-        sqlx::query!(
-            r#"
-            UPDATE l1_batches
-            SET
-                hash = $1,
-                merkle_root_hash = $2,
-                commitment = $3,
-                default_aa_code_hash = $4,
-                compressed_repeated_writes = $5,
-                compressed_initial_writes = $6,
-                l2_l1_compressed_messages = $7,
-                l2_l1_merkle_root = $8,
-                zkporter_is_available = $9,
-                bootloader_code_hash = $10,
-                rollup_last_leaf_index = $11,
-                aux_data_hash = $12,
-                pass_through_data_hash = $13,
-                meta_parameters_hash = $14,
-                compressed_state_diffs = $15,
-                updated_at = NOW()
-            WHERE
-                number = $16
-            "#,
-            metadata.root_hash.as_bytes(),
-            metadata.merkle_root_hash.as_bytes(),
-            metadata.commitment.as_bytes(),
-            metadata.block_meta_params.default_aa_code_hash.as_bytes(),
-            metadata.repeated_writes_compressed,
-            metadata.initial_writes_compressed,
-            metadata.l2_l1_messages_compressed,
-            metadata.l2_l1_merkle_root.as_bytes(),
-            metadata.block_meta_params.zkporter_is_available,
-            metadata.block_meta_params.bootloader_code_hash.as_bytes(),
-            metadata.rollup_last_leaf_index as i64,
-            metadata.aux_data_hash.as_bytes(),
-            metadata.pass_through_data_hash.as_bytes(),
-            metadata.meta_parameters_hash.as_bytes(),
-            metadata.state_diffs_compressed,
-            0,
-        )
-        .execute(self.storage.conn())
-        .await?;
-        Ok(())
-    }
-
-    pub async fn save_l1_batch_metadata(
+    pub async fn save_l1_batch_tree_data(
         &mut self,
         number: L1BatchNumber,
-        metadata: &L1BatchMetadata,
-        previous_root_hash: H256,
-        is_pre_boojum: bool,
+        tree_data: &L1BatchTreeData,
     ) -> anyhow::Result<()> {
-        let mut transaction = self.storage.start_transaction().await?;
-
         let update_result = sqlx::query!(
             r#"
             UPDATE l1_batches
             SET
                 hash = $1,
-                merkle_root_hash = $2,
-                compressed_repeated_writes = $3,
-                compressed_initial_writes = $4,
-                l2_l1_compressed_messages = $5,
-                l2_l1_merkle_root = $6,
-                zkporter_is_available = $7,
-                parent_hash = $8,
-                rollup_last_leaf_index = $9,
-                pass_through_data_hash = $10,
-                meta_parameters_hash = $11,
-                compressed_state_diffs = $12,
+                merkle_root_hash = $1,
+                rollup_last_leaf_index = $2,
                 updated_at = NOW()
             WHERE
-                number = $13
+                number = $3
                 AND hash IS NULL
             "#,
-            metadata.root_hash.as_bytes(),
-            metadata.merkle_root_hash.as_bytes(),
-            metadata.repeated_writes_compressed,
-            metadata.initial_writes_compressed,
-            metadata.l2_l1_messages_compressed,
-            metadata.l2_l1_merkle_root.as_bytes(),
-            metadata.block_meta_params.zkporter_is_available,
-            previous_root_hash.as_bytes(),
-            metadata.rollup_last_leaf_index as i64,
-            metadata.pass_through_data_hash.as_bytes(),
-            metadata.meta_parameters_hash.as_bytes(),
-            metadata.state_diffs_compressed,
+            tree_data.hash.as_bytes(),
+            tree_data.rollup_last_leaf_index as i64,
             number.0 as i64,
         )
-        .instrument("save_blocks_metadata")
+        .instrument("save_batch_tree_data")
         .with_arg("number", &number)
         .report_latency()
-        .execute(transaction.conn())
+        .execute(self.storage)
         .await?;
 
-        if metadata.events_queue_commitment.is_some() || is_pre_boojum {
-            // Save `commitment`, `aux_data_hash`, `events_queue_commitment`, `bootloader_initial_content_commitment`.
-            sqlx::query!(
-                r#"
-                INSERT INTO
-                    commitments (l1_batch_number, events_queue_commitment, bootloader_initial_content_commitment)
-                VALUES
-                    ($1, $2, $3)
-                ON CONFLICT (l1_batch_number) DO NOTHING
-                "#,
-                number.0 as i64,
-                metadata.events_queue_commitment.map(|h| h.0.to_vec()),
-                metadata
-                    .bootloader_initial_content_commitment
-                    .map(|h| h.0.to_vec()),
-            )
-            .instrument("save_batch_commitments")
-            .with_arg("number", &number)
-            .report_latency()
-            .execute(transaction.conn())
-            .await?;
-
-            sqlx::query!(
-                r#"
-                UPDATE l1_batches
-                SET
-                    commitment = $2,
-                    aux_data_hash = $3,
-                    updated_at = NOW()
-                WHERE
-                    number = $1
-                "#,
-                number.0 as i64,
-                metadata.commitment.as_bytes(),
-                metadata.aux_data_hash.as_bytes(),
-            )
-            .instrument("save_batch_aux_commitment")
-            .with_arg("number", &number)
-            .report_latency()
-            .execute(transaction.conn())
-            .await?;
-        }
-
         if update_result.rows_affected() == 0 {
-            tracing::debug!(
-                "L1 batch {} info wasn't updated. Details: root_hash: {:?}, merkle_root_hash: {:?}, \
-                 parent_hash: {:?}, commitment: {:?}, l2_l1_merkle_root: {:?}",
-                number.0 as i64,
-                metadata.root_hash,
-                metadata.merkle_root_hash,
-                previous_root_hash,
-                metadata.commitment,
-                metadata.l2_l1_merkle_root
-            );
+            tracing::debug!("L1 batch #{number}: tree data wasn't updated as it's already present");
 
-            // block was already processed. Verify that existing hashes match
+            // Batch was already processed. Verify that existing hash matches
             let matched: i64 = sqlx::query!(
                 r#"
                 SELECT
@@ -888,31 +792,129 @@ impl BlocksDal<'_, '_> {
                 WHERE
                     number = $1
                     AND hash = $2
-                    AND merkle_root_hash = $3
-                    AND parent_hash = $4
-                    AND l2_l1_merkle_root = $5
                 "#,
                 number.0 as i64,
-                metadata.root_hash.as_bytes(),
-                metadata.merkle_root_hash.as_bytes(),
-                previous_root_hash.as_bytes(),
-                metadata.l2_l1_merkle_root.as_bytes(),
+                tree_data.hash.as_bytes(),
             )
-            .instrument("get_matching_blocks_metadata")
+            .instrument("get_matching_batch_hash")
             .with_arg("number", &number)
             .report_latency()
-            .fetch_one(transaction.conn())
+            .fetch_one(self.storage)
             .await?
             .count;
 
-            anyhow::ensure!(matched == 1,
-                "Root hash verification failed. Hashes for L1 batch #{} do not match the expected values \
-                 (expected state hash: {:?}, L2 to L1 logs hash: {:?})",
+            anyhow::ensure!(
+                matched == 1,
+                "Root hash verification failed. Hash for L1 batch #{} does not match the expected value \
+                 (expected root hash: {:?})",
                 number,
-                metadata.root_hash,
-                metadata.l2_l1_merkle_root
+                tree_data.hash,
             );
         }
+        Ok(())
+    }
+
+    pub async fn save_l1_batch_commitment_artifacts(
+        &mut self,
+        number: L1BatchNumber,
+        commitment_artifacts: &L1BatchCommitmentArtifacts,
+    ) -> anyhow::Result<()> {
+        let mut transaction = self.storage.start_transaction().await?;
+
+        let update_result = sqlx::query!(
+            r#"
+            UPDATE l1_batches
+            SET
+                commitment = $1,
+                aux_data_hash = $2,
+                pass_through_data_hash = $3,
+                meta_parameters_hash = $4,
+                l2_l1_merkle_root = $5,
+                zkporter_is_available = $6,
+                compressed_state_diffs = $7,
+                compressed_initial_writes = $8,
+                compressed_repeated_writes = $9,
+                updated_at = NOW()
+            WHERE
+                number = $10
+                AND commitment IS NULL
+            "#,
+            commitment_artifacts.commitment_hash.commitment.as_bytes(),
+            commitment_artifacts.commitment_hash.aux_output.as_bytes(),
+            commitment_artifacts
+                .commitment_hash
+                .pass_through_data
+                .as_bytes(),
+            commitment_artifacts
+                .commitment_hash
+                .meta_parameters
+                .as_bytes(),
+            commitment_artifacts.l2_l1_merkle_root.as_bytes(),
+            commitment_artifacts.zkporter_is_available,
+            commitment_artifacts.compressed_state_diffs,
+            commitment_artifacts.compressed_initial_writes,
+            commitment_artifacts.compressed_repeated_writes,
+            number.0 as i64,
+        )
+        .instrument("save_l1_batch_commitment_artifacts")
+        .with_arg("number", &number)
+        .report_latency()
+        .execute(&mut transaction)
+        .await?;
+        if update_result.rows_affected() == 0 {
+            tracing::debug!(
+                "L1 batch #{number}: commitment info wasn't updated as it's already present"
+            );
+
+            // Batch was already processed. Verify that existing commitment matches
+            let matched: i64 = sqlx::query!(
+                r#"
+                SELECT
+                    COUNT(*) AS "count!"
+                FROM
+                    l1_batches
+                WHERE
+                    number = $1
+                    AND commitment = $2
+                "#,
+                number.0 as i64,
+                commitment_artifacts.commitment_hash.commitment.as_bytes(),
+            )
+            .instrument("get_matching_batch_commitment")
+            .with_arg("number", &number)
+            .report_latency()
+            .fetch_one(&mut transaction)
+            .await?
+            .count;
+
+            anyhow::ensure!(
+                matched == 1,
+                "Commitment verification failed. Commitment for L1 batch #{} does not match the expected value \
+                 (expected commitment: {:?})",
+                number,
+                commitment_artifacts.commitment_hash.commitment
+            );
+        }
+
+        sqlx::query!(
+            r#"
+            INSERT INTO
+                commitments (l1_batch_number, events_queue_commitment, bootloader_initial_content_commitment)
+            VALUES
+                ($1, $2, $3)
+            ON CONFLICT (l1_batch_number) DO NOTHING
+            "#,
+            number.0 as i64,
+            commitment_artifacts.aux_commitments.map(|a| a.events_queue_commitment.0.to_vec()),
+            commitment_artifacts.aux_commitments
+                .map(|a| a.bootloader_initial_content_commitment.0.to_vec()),
+        )
+        .instrument("save_batch_aux_commitments")
+        .with_arg("number", &number)
+        .report_latency()
+        .execute(&mut transaction)
+        .await?;
+
         transaction.commit().await?;
         Ok(())
     }
@@ -932,10 +934,7 @@ impl BlocksDal<'_, '_> {
                 bloom,
                 priority_ops_onchain_data,
                 hash,
-                parent_hash,
                 commitment,
-                compressed_write_logs,
-                compressed_contracts,
                 eth_prove_tx_id,
                 eth_commit_tx_id,
                 eth_execute_tx_id,
@@ -945,7 +944,6 @@ impl BlocksDal<'_, '_> {
                 used_contract_hashes,
                 compressed_initial_writes,
                 compressed_repeated_writes,
-                l2_l1_compressed_messages,
                 l2_l1_merkle_root,
                 rollup_last_leaf_index,
                 zkporter_is_available,
@@ -974,7 +972,7 @@ impl BlocksDal<'_, '_> {
             "#,
         )
         .instrument("get_last_committed_to_eth_l1_batch")
-        .fetch_one(self.storage.conn())
+        .fetch_one(self.storage)
         .await?;
         // genesis block is first generated without commitment, we should wait for the tree to set it.
         if block.commitment.is_none() {
@@ -1098,6 +1096,10 @@ impl BlocksDal<'_, '_> {
     }
 
     /// This method returns batches that are confirmed on L1. That is, it doesn't wait for the proofs to be generated.
+    ///
+    /// # Params:
+    /// * `commited_tx_confirmed`: whether to look for ready proofs only for txs for which
+    ///   respective commit transactions have been confirmed by the network.
     pub async fn get_ready_for_dummy_proof_l1_batches(
         &mut self,
         limit: usize,
@@ -1113,10 +1115,7 @@ impl BlocksDal<'_, '_> {
                 bloom,
                 priority_ops_onchain_data,
                 hash,
-                parent_hash,
                 commitment,
-                compressed_write_logs,
-                compressed_contracts,
                 eth_prove_tx_id,
                 eth_commit_tx_id,
                 eth_execute_tx_id,
@@ -1126,7 +1125,6 @@ impl BlocksDal<'_, '_> {
                 used_contract_hashes,
                 compressed_initial_writes,
                 compressed_repeated_writes,
-                l2_l1_compressed_messages,
                 l2_l1_merkle_root,
                 rollup_last_leaf_index,
                 zkporter_is_available,
@@ -1156,7 +1154,7 @@ impl BlocksDal<'_, '_> {
         )
         .instrument("get_ready_for_dummy_proof_l1_batches")
         .with_arg("limit", &limit)
-        .fetch_all(self.storage.conn())
+        .fetch_all(self.storage)
         .await?;
 
         self.map_l1_batches(raw_batches)
@@ -1221,10 +1219,7 @@ impl BlocksDal<'_, '_> {
                 bloom,
                 priority_ops_onchain_data,
                 hash,
-                parent_hash,
                 commitment,
-                compressed_write_logs,
-                compressed_contracts,
                 eth_prove_tx_id,
                 eth_commit_tx_id,
                 eth_execute_tx_id,
@@ -1234,7 +1229,6 @@ impl BlocksDal<'_, '_> {
                 used_contract_hashes,
                 compressed_initial_writes,
                 compressed_repeated_writes,
-                l2_l1_compressed_messages,
                 l2_l1_merkle_root,
                 rollup_last_leaf_index,
                 zkporter_is_available,
@@ -1277,7 +1271,7 @@ impl BlocksDal<'_, '_> {
         )
         .instrument("get_skipped_for_proof_l1_batches")
         .with_arg("limit", &limit)
-        .fetch_all(self.storage.conn())
+        .fetch_all(self.storage)
         .await?;
 
         self.map_l1_batches(raw_batches)
@@ -1303,10 +1297,7 @@ impl BlocksDal<'_, '_> {
                         bloom,
                         priority_ops_onchain_data,
                         hash,
-                        parent_hash,
                         commitment,
-                        compressed_write_logs,
-                        compressed_contracts,
                         eth_prove_tx_id,
                         eth_commit_tx_id,
                         eth_execute_tx_id,
@@ -1316,7 +1307,6 @@ impl BlocksDal<'_, '_> {
                         used_contract_hashes,
                         compressed_initial_writes,
                         compressed_repeated_writes,
-                        l2_l1_compressed_messages,
                         l2_l1_merkle_root,
                         rollup_last_leaf_index,
                         zkporter_is_available,
@@ -1346,7 +1336,7 @@ impl BlocksDal<'_, '_> {
                 )
                 .instrument("get_ready_for_execute_l1_batches/no_max_timestamp")
                 .with_arg("limit", &limit)
-                .fetch_all(self.storage.conn())
+                .fetch_all(self.storage)
                 .await?
             }
 
@@ -1437,10 +1427,7 @@ impl BlocksDal<'_, '_> {
                     bloom,
                     priority_ops_onchain_data,
                     hash,
-                    parent_hash,
                     commitment,
-                    compressed_write_logs,
-                    compressed_contracts,
                     eth_prove_tx_id,
                     eth_commit_tx_id,
                     eth_execute_tx_id,
@@ -1450,7 +1437,6 @@ impl BlocksDal<'_, '_> {
                     used_contract_hashes,
                     compressed_initial_writes,
                     compressed_repeated_writes,
-                    l2_l1_compressed_messages,
                     l2_l1_merkle_root,
                     rollup_last_leaf_index,
                     zkporter_is_available,
@@ -1485,7 +1471,7 @@ impl BlocksDal<'_, '_> {
                 &(expected_started_point..=max_ready_to_send_block),
             )
             .with_arg("limit", &limit)
-            .fetch_all(self.storage.conn())
+            .fetch_all(self.storage)
             .await?
         } else {
             vec![]
@@ -1510,10 +1496,7 @@ impl BlocksDal<'_, '_> {
                 bloom,
                 priority_ops_onchain_data,
                 hash,
-                parent_hash,
                 commitment,
-                compressed_write_logs,
-                compressed_contracts,
                 eth_prove_tx_id,
                 eth_commit_tx_id,
                 eth_execute_tx_id,
@@ -1523,7 +1506,6 @@ impl BlocksDal<'_, '_> {
                 used_contract_hashes,
                 compressed_initial_writes,
                 compressed_repeated_writes,
-                l2_l1_compressed_messages,
                 l2_l1_merkle_root,
                 rollup_last_leaf_index,
                 zkporter_is_available,
@@ -1567,7 +1549,7 @@ impl BlocksDal<'_, '_> {
         .with_arg("bootloader_hash", &bootloader_hash)
         .with_arg("default_aa_hash", &default_aa_hash)
         .with_arg("protocol_version_id", &protocol_version_id)
-        .fetch_all(self.storage.conn())
+        .fetch_all(self.storage)
         .await?;
 
         self.map_l1_batches(raw_batches)
@@ -1593,10 +1575,7 @@ impl BlocksDal<'_, '_> {
                 bloom,
                 priority_ops_onchain_data,
                 hash,
-                parent_hash,
                 commitment,
-                compressed_write_logs,
-                compressed_contracts,
                 eth_prove_tx_id,
                 eth_commit_tx_id,
                 eth_execute_tx_id,
@@ -1606,7 +1585,6 @@ impl BlocksDal<'_, '_> {
                 used_contract_hashes,
                 compressed_initial_writes,
                 compressed_repeated_writes,
-                l2_l1_compressed_messages,
                 l2_l1_merkle_root,
                 rollup_last_leaf_index,
                 zkporter_is_available,
@@ -1652,7 +1630,7 @@ impl BlocksDal<'_, '_> {
         .with_arg("bootloader_hash", &bootloader_hash)
         .with_arg("default_aa_hash", &default_aa_hash)
         .with_arg("protocol_version_id", &protocol_version_id)
-        .fetch_all(self.storage.conn())
+        .fetch_all(self.storage)
         .await?;
 
         self.map_l1_batches(raw_batches)
@@ -1724,6 +1702,32 @@ impl BlocksDal<'_, '_> {
             .context("get_l1_batch_with_metadata")
     }
 
+    pub async fn get_l1_batch_tree_data(
+        &mut self,
+        number: L1BatchNumber,
+    ) -> anyhow::Result<Option<L1BatchTreeData>> {
+        let row = sqlx::query!(
+            r#"
+            SELECT
+                hash,
+                rollup_last_leaf_index
+            FROM
+                l1_batches
+            WHERE
+                number = $1
+            "#,
+            number.0 as i64
+        )
+        .fetch_optional(self.storage.conn())
+        .await?;
+        Ok(row.and_then(|row| {
+            Some(L1BatchTreeData {
+                hash: H256::from_slice(&row.hash?),
+                rollup_last_leaf_index: row.rollup_last_leaf_index? as u64,
+            })
+        }))
+    }
+
     pub async fn get_l1_batch_with_metadata(
         &mut self,
         storage_batch: StorageL1Batch,
@@ -1732,15 +1736,21 @@ impl BlocksDal<'_, '_> {
             .get_l1_batch_factory_deps(L1BatchNumber(storage_batch.number as u32))
             .await
             .context("get_l1_batch_factory_deps()")?;
-        let header = storage_batch.clone().into();
+        let header: L1BatchHeader = storage_batch.clone().into();
         let Ok(metadata) = storage_batch.try_into() else {
             return Ok(None);
         };
+        let raw_published_bytecode_hashes = self
+            .storage
+            .events_dal()
+            .get_l1_batch_raw_published_bytecode_hashes(header.number)
+            .await?;
 
         Ok(Some(L1BatchWithMetadata::new(
             header,
             metadata,
             unsorted_factory_deps,
+            &raw_published_bytecode_hashes,
         )))
     }
 
@@ -1853,45 +1863,31 @@ impl BlocksDal<'_, '_> {
         number_range: ops::RangeInclusive<L1BatchNumber>,
         op_type: AggregatedActionType,
     ) -> anyhow::Result<u32> {
-        let column_name = match op_type {
-            AggregatedActionType::Commit => "predicted_commit_gas_cost",
-            AggregatedActionType::PublishProofOnchain => "predicted_prove_gas_cost",
-            AggregatedActionType::Execute => "predicted_execute_gas_cost",
-        };
-        let sql_query_str = format!(
-            "SELECT COALESCE(SUM({column_name}), 0) AS sum FROM l1_batches \
-             WHERE number BETWEEN $1 AND $2"
+        #[derive(Debug)]
+        struct SumRow {
+            sum: BigDecimal,
+        }
+
+        let start = number_range.start().0 as i64;
+        let end = number_range.end().0 as i64;
+        let query = match_query_as!(
+            SumRow,
+            [
+                "SELECT COALESCE(SUM(", _, r#"), 0) AS "sum!" FROM l1_batches WHERE number BETWEEN $1 AND $2"#
+            ],
+            match (op_type) {
+                AggregatedActionType::Commit => ("predicted_commit_gas_cost"; start, end),
+                AggregatedActionType::PublishProofOnchain => ("predicted_prove_gas_cost"; start, end),
+                AggregatedActionType::Execute => ("predicted_execute_gas_cost"; start, end),
+            }
         );
-        sqlx::query(&sql_query_str)
-            .bind(number_range.start().0 as i64)
-            .bind(number_range.end().0 as i64)
+
+        query
             .fetch_one(self.storage.conn())
             .await?
-            .get::<BigDecimal, &str>("sum")
+            .sum
             .to_u32()
             .context("Sum of predicted gas costs should fit into u32")
-    }
-
-    pub async fn update_predicted_l1_batch_commit_gas(
-        &mut self,
-        number: L1BatchNumber,
-        predicted_gas_cost: u32,
-    ) -> sqlx::Result<()> {
-        sqlx::query!(
-            r#"
-            UPDATE l1_batches
-            SET
-                predicted_commit_gas_cost = $2,
-                updated_at = NOW()
-            WHERE
-                number = $1
-            "#,
-            number.0 as i64,
-            predicted_gas_cost as i64
-        )
-        .execute(self.storage.conn())
-        .await?;
-        Ok(())
     }
 
     pub async fn get_miniblock_range_of_l1_batch(

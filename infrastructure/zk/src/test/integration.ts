@@ -19,18 +19,13 @@ export async function contractVerification(bail: boolean = false) {
     await utils.spawn('yarn ts-integration contract-verification-test' + flag);
 }
 
-export async function snapshotsCreator(bail: boolean = false) {
-    const flag = bail ? ' --bail' : '';
-    await utils.spawn('yarn ts-integration snapshots-creator-test' + flag);
-}
-
 export async function server(options: string[] = []) {
     if (process.env.ZKSYNC_ENV?.startsWith('ext-node')) {
         process.env.ZKSYNC_WEB3_API_URL = `http://127.0.0.1:${process.env.EN_HTTP_PORT}`;
         process.env.ZKSYNC_WEB3_WS_API_URL = `ws://127.0.0.1:${process.env.EN_WS_PORT}`;
         process.env.ETH_CLIENT_WEB3_URL = process.env.EN_ETH_CLIENT_URL;
 
-        const configs = config.collectVariables(config.loadConfig(process.env.ZKSYNC_ENV, true));
+        const configs = config.collectVariables(config.loadConfig('dev'));
 
         process.env.CONTRACTS_PRIORITY_TX_MAX_GAS_LIMIT = configs.get('CONTRACTS_PRIORITY_TX_MAX_GAS_LIMIT');
         process.env.CHAIN_STATE_KEEPER_VALIDATION_COMPUTATIONAL_GAS_LIMIT = configs.get(
@@ -48,6 +43,11 @@ export async function fees() {
 export async function revert(bail: boolean = false) {
     const flag = bail ? ' --bail' : '';
     await utils.spawn('yarn revert-test revert-and-restart-test' + flag);
+}
+
+export async function revert_en(bail: boolean = false) {
+    const flag = bail ? ' --bail' : '';
+    await utils.spawn('yarn revert-test revert-and-restart-test-en' + flag);
 }
 
 export async function upgrade(bail: boolean = false) {
@@ -86,7 +86,13 @@ command
     .action(async (cmd: Command) => {
         await revert(cmd.bail);
     });
-
+command
+    .command('revert-en')
+    .description('run EN revert test')
+    .option('--bail')
+    .action(async (cmd: Command) => {
+        await revert_en(cmd.bail);
+    });
 command
     .command('upgrade')
     .description('run upgrade test')
@@ -108,12 +114,4 @@ command
     .option('--bail')
     .action(async (cmd: Command) => {
         await contractVerification(cmd.bail);
-    });
-
-command
-    .command('snapshots-creator')
-    .description('run snapshots creator tests')
-    .option('--bail')
-    .action(async (cmd: Command) => {
-        await snapshotsCreator(cmd.bail);
     });

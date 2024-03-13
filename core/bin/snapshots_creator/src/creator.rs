@@ -94,7 +94,7 @@ impl SnapshotCreator {
             METRICS.storage_logs_processing_duration[&StorageChunkStage::LoadFromPostgres].start();
         let logs = conn
             .snapshots_creator_dal()
-            .get_storage_logs_chunk(miniblock_number, hashed_keys_range)
+            .get_storage_logs_chunk(miniblock_number, l1_batch_number, hashed_keys_range)
             .await
             .context("Error fetching storage logs count")?;
         drop(conn);
@@ -266,6 +266,10 @@ impl SnapshotCreator {
         config: SnapshotsCreatorConfig,
         min_chunk_count: u64,
     ) -> anyhow::Result<()> {
+        tracing::info!(
+            "Starting snapshot creator with object store {:?} and config {config:?}",
+            self.blob_store
+        );
         let latency = METRICS.snapshot_generation_duration.start();
 
         let Some(progress) = self
